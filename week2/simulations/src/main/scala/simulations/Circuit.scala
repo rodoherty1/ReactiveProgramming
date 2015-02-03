@@ -1,13 +1,11 @@
 package simulations
 
-import common._
-
 class Wire {
   private var sigVal = false
   private var actions: List[Simulator#Action] = List()
 
   def getSignal: Boolean = sigVal
-  
+
   def setSignal(s: Boolean) {
     if (s != sigVal) {
       sigVal = s
@@ -31,7 +29,7 @@ abstract class CircuitSimulator extends Simulator {
     wire addAction {
       () => afterDelay(0) {
         println(
-          "  " + currentTime + ": " + name + " -> " +  wire.getSignal)
+          "  " + currentTime + ": " + name + " -> " + wire.getSignal)
       }
     }
   }
@@ -39,7 +37,9 @@ abstract class CircuitSimulator extends Simulator {
   def inverter(input: Wire, output: Wire) {
     def invertAction() {
       val inputSig = input.getSignal
-      afterDelay(InverterDelay) { output.setSignal(!inputSig) }
+      afterDelay(InverterDelay) {
+        output.setSignal(!inputSig)
+      }
     }
     input addAction invertAction
   }
@@ -48,7 +48,9 @@ abstract class CircuitSimulator extends Simulator {
     def andAction() {
       val a1Sig = a1.getSignal
       val a2Sig = a2.getSignal
-      afterDelay(AndGateDelay) { output.setSignal(a1Sig & a2Sig) }
+      afterDelay(AndGateDelay) {
+        output.setSignal(a1Sig & a2Sig)
+      }
     }
     a1 addAction andAction
     a2 addAction andAction
@@ -58,16 +60,42 @@ abstract class CircuitSimulator extends Simulator {
   // to complete with orGates and demux...
   //
 
-  def orGate(a1: Wire, a2: Wire, output: Wire) {
-    ???
+  def orGate(a1: Wire, a2: Wire, output: Wire): Unit = {
+    def orAction(): Unit = {
+      val a1Sig = a1.getSignal
+      val a2Sig = a2.getSignal
+
+      afterDelay(OrGateDelay) {
+        output.setSignal(a1Sig | a2Sig)
+      }
+    }
+
+    a1 addAction orAction
+    a2 addAction orAction
   }
-  
+
   def orGate2(a1: Wire, a2: Wire, output: Wire) {
-    ???
+    val notIn1, notIn2, andOut = new Wire
+
+    inverter(a1, notIn1)
+    inverter(a2, notIn2)
+    andGate(notIn1, notIn2, andOut)
+    inverter(andOut, output)
   }
 
   def demux(in: Wire, c: List[Wire], out: List[Wire]) {
-    ???
+    // c = { 0, 1, 1} == 3
+
+    /*
+    if in is true
+    and c is {0}
+    then out is true
+     */
+
+    /*
+    if in is true
+    c is {0, 1}
+     */
   }
 
 }
