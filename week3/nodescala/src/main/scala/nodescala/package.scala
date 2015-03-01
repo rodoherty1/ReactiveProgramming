@@ -38,12 +38,13 @@ package object nodescala {
      */
     def all[T](fs: List[Future[T]]): Future[List[T]] = {
       val successful = Promise[List[T]]()
-      successful.future
+      successful.success(Nil)
       
-      fs.foldRight(successful.future)((f, acc) => for {
-        x <- f
-        xs <- acc
-      } yield x :: xs)
+      fs.foldRight(successful.future) {(f, acc) => for {
+          x <- f
+          xs <- acc
+        } yield x :: xs
+      }
     }
 
     /** Given a list of futures `fs`, returns the future holding the value of the future from `fs` that completed first.
@@ -55,11 +56,28 @@ package object nodescala {
      *
      *  may return a `Future` succeeded with `1`, `2` or failed with an `Exception`.
      */
-    def any[T](fs: List[Future[T]]): Future[T] = ???
+    def any[T](fs: List[Future[T]]): Future[T] = {
+      val p = Promise[T]()
+      
+      fs.foreach(f => f.onComplete { p.tryComplete })
+      
+      p.future
+    }
 
     /** Returns a future with a unit value that is completed after time `t`.
      */
-    def delay(t: Duration): Future[Unit] = ???
+    def delay(t: Duration): Future[Unit] = {
+      val p = Promise[Unit]()
+      val f = p.future
+      f.onComplete(res => 
+        blocking {
+          Thread.sleep(t.toMillis)          
+        }
+      )
+      
+      p.success()
+      f
+    }
 
     /** Completes this future with user input.
      */

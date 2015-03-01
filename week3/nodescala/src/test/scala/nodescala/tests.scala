@@ -34,6 +34,17 @@ class NodeScalaSuite extends FunSuite {
     }
   }
 
+  
+  test("Sequence over a List[Future[T]]") {
+    val seq1 = Future.all(List(Future{1}, Future{2}))
+    val t = seq1.value.get
+    t match {
+      case Success(l) => assert(l(0) == 1);  assert(l(1) == 2)
+      case (_) => fail()
+    }
+    
+  }
+  
   test("CancellationTokenSource should allow stopping the computation") {
     val cts = CancellationTokenSource()
     val ct = cts.cancellationToken
