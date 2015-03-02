@@ -35,8 +35,21 @@ class NodeScalaSuite extends FunSuite {
   }
 
   
-  test("Sequence over a List[Future[T]]") {
-    val seq1 = Future.all(List(Future{1}, Future{2}))
+  ignore("Sequence over a List[Future[T]]") {
+    val p1 = Promise[Int]()
+    val f1 = p1.future
+    p1.complete(Success(1))
+
+    val p2 = Promise[Int]()
+    val f2 = p2.future
+    p2.complete(Success(2))
+    
+    val seq1 = Future.all(List(f1, f2))
+    seq1.value match {
+      case None => fail("WHAT??")
+      case _ => println ("OK")
+    }
+    
     val t = seq1.value.get
     t match {
       case Success(l) => assert(l(0) == 1);  assert(l(1) == 2)
