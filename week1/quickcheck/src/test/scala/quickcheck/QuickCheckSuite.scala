@@ -15,7 +15,7 @@ import org.scalatest.exceptions.TestFailedException
 object QuickCheckBinomialHeap extends QuickCheckHeap with BinomialHeap
 
 @RunWith(classOf[JUnitRunner])
-class QuickCheckSuite extends FunSuite with Checkers {
+class QuickCheckSuite extends FunSuite with ch.epfl.lamp.grading.GradingSuite with Checkers {
   def checkBogus(p: Prop) {
     var ok = false
     try {

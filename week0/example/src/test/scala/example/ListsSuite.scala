@@ -25,7 +25,6 @@ import org.scalatest.junit.JUnitRunner
  */
 @RunWith(classOf[JUnitRunner])
 class ListsSuite extends FunSuite {
-
   /**
    * Tests are written using the `test` operator which takes two arguments:
    *
@@ -39,7 +38,6 @@ class ListsSuite extends FunSuite {
    */
   test("one plus one is two")(assert(1 + 1 == 2))
 
-
   /**
    * In Scala, it is allowed to pass an argument to a method using the block
    * syntax, i.e. `{ argument }` instead of parentheses `(argument)`.
@@ -47,9 +45,8 @@ class ListsSuite extends FunSuite {
    * This allows tests to be written in a more readable manner:
    */
   test("one plus one is three?") {
-    (1 + 1) equals(3) // This assertion fails! Go ahead and fix it.
+    assert(1 + 1 != 3) // This assertion fails! Go ahead and fix it.
   }
-
 
   /**
    * One problem with the previous (failing) test is that ScalaTest will
@@ -74,7 +71,6 @@ class ListsSuite extends FunSuite {
   test("details why one plus one is not three") {
     assert(1 + 1 === 2) // Fix me, please!
   }
-
 
   /**
    * In order to test the exceptional behavior of a methods, ScalaTest offers
@@ -117,8 +113,8 @@ class ListsSuite extends FunSuite {
   test("sum of a few numbers") {
     assert(sum(List(1,2,0)) === 3)
   }
-  
   test("max of a few numbers") {
     assert(max(List(3, 7, 2)) === 7)
   }
+
 }
