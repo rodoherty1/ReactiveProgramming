@@ -20,33 +20,9 @@ object Calculator {
   def computeValues(namedExpressions: Map[String, Signal[Expr]]): Map[String, Signal[Double]] = {
 
     namedExpressions.map {
-      case (k, v) => {
-        v() match {
-          case Ref(n) => if (n == k) (k, Signal(Literal(Double.NaN))) else (k, v)
-          case _ => (k, v)
-        }
-      }
-    } map {
-
-      // When there is a change in the UI, the code inside Var { } is reevaluated.
-      case (k, v) => (k, Var { eval(v(), removeSelfRefs(k, namedExpressions)) })
+      case (k, v) => (k, Var { eval(v(), namedExpressions) })
     }
   }
-
-  def removeSelfRefs(name: String, refs: Map[String, Signal[Expr]]): Map[String, Signal[Expr]] = {
-    refs.map {
-      case (k, v) if k == name => (k, Signal[Expr](Literal(Double.NaN)))
-      case (k, v) => (k, v)
-    } map {
-      case (k, v) => {
-        v() match {
-          case Ref(n) if n == name => (k, Signal[Expr](Literal(Double.NaN)))
-          case _ => (k, v)
-        }
-      }
-    }
-  }
-
 
   def eval(expr: Expr, references: Map[String, Signal[Expr]]): Double = {
     expr match {
@@ -55,7 +31,7 @@ object Calculator {
       case Minus(e1, e2) => eval(e1, references) - eval(e2, references)
       case Times(e1, e2) => eval(e1, references) * eval(e2, references)
       case Divide(e1, e2) => eval(e1, references) / eval(e2, references)
-      case Ref(name) => eval(getReferenceExpr(name, references), references)
+      case Ref(name) => eval(getReferenceExpr(name, references), references filter (kv => kv._1 != name))
       case _ => Double.NaN
     }
   }
