@@ -1,7 +1,5 @@
 package nodescala
 
-
-
 import scala.language.postfixOps
 import scala.util.{Try, Success, Failure}
 import scala.collection._
@@ -17,13 +15,12 @@ import org.scalatest.junit.JUnitRunner
 @RunWith(classOf[JUnitRunner])
 class NodeScalaSuite extends FunSuite {
 
-  test("A Future should always be created") {
+  test("A Future should always be completed") {
     val always = Future.always(517)
 
     assert(Await.result(always, 0 nanos) == 517)
   }
-
-  test("A Future should never be created") {
+  test("A Future should never be completed") {
     val never = Future.never[Int]
 
     try {
@@ -34,30 +31,52 @@ class NodeScalaSuite extends FunSuite {
     }
   }
 
-  
-  ignore("Sequence over a List[Future[T]]") {
-    val p1 = Promise[Int]()
-    val f1 = p1.future
-    p1.complete(Success(1))
-
-    val p2 = Promise[Int]()
-    val f2 = p2.future
-    p2.complete(Success(2))
-    
-    val seq1 = Future.all(List(f1, f2))
-    seq1.value match {
-      case None => fail("WHAT??")
-      case _ => println ("OK")
-    }
-    
-    val t = seq1.value.get
-    t match {
-      case Success(l) => assert(l(0) == 1);  assert(l(1) == 2)
-      case (_) => fail()
-    }
-    
+  test("Any Future in the list should be completed") {
+    val l = List(Future{ 1 }, Future { 2 }, Future { 3 })
+    val any: Future[Int] = Future.any(l)
+    val v: Int = Await.result(any, 50 millis)
+    assert(v == 1 || v == 2 || v == 3)
   }
-  
+
+  test("Any Future in the list should be failed") {
+    val l = List(Future{ throw new Exception  }, Future { throw new Exception }, Future { throw new Exception  })
+    val any: Future[Int] = Future.any(l)
+
+    any onFailure {
+      case e: Exception => assert(true)
+      case _ => fail("Exception not caught as expected")
+    }
+  }
+
+  test("A Future should complete after a delay") {
+
+    val r: Future[Unit] = Future.delay(3 seconds)
+
+    blocking { Thread.sleep(1000) }
+
+    assert(!r.isCompleted)
+
+    blocking { Thread.sleep(3000) }
+
+    assert(r.isCompleted)
+  }
+
+
+  test("Test Cancellation") {
+    val working = Future.run() { ct =>
+      Future {
+        while (ct.nonCancelled) {
+          println("working")
+        }
+        println("done")
+      }
+    }
+    Future.delay(1 second) onSuccess {
+      case _ => working.unsubscribe()
+    }
+  }
+
+
   test("CancellationTokenSource should allow stopping the computation") {
     val cts = CancellationTokenSource()
     val ct = cts.cancellationToken
@@ -133,25 +152,6 @@ class NodeScalaSuite extends FunSuite {
       l.emit(req)
     }
   }
-
-  test("Listener should serve the next request as a future") {
-    val dummy = new DummyListener(8191, "/test")
-    val subscription = dummy.start()
-
-    def test(req: Request) {
-      val f = dummy.nextRequest()
-      dummy.emit(req)
-      val (reqReturned, xchg) = Await.result(f, 1 second)
-
-      assert(reqReturned == req)
-    }
-
-    test(immutable.Map("StrangeHeader" -> List("StrangeValue1")))
-    test(immutable.Map("StrangeHeader" -> List("StrangeValue2")))
-
-    subscription.unsubscribe()
-  }
-
   test("Server should serve requests") {
     val dummy = new DummyServer(8191)
     val dummySubscription = dummy.start("/testDir") {
