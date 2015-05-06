@@ -61,22 +61,6 @@ class NodeScalaSuite extends FunSuite {
     assert(r.isCompleted)
   }
 
-
-  test("Test Cancellation") {
-    val working = Future.run() { ct =>
-      Future {
-        while (ct.nonCancelled) {
-          println("working")
-        }
-        println("done")
-      }
-    }
-    Future.delay(1 second) onSuccess {
-      case _ => working.unsubscribe()
-    }
-  }
-
-
   test("CancellationTokenSource should allow stopping the computation") {
     val cts = CancellationTokenSource()
     val ct = cts.cancellationToken

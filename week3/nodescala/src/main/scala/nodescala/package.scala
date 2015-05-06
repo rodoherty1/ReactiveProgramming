@@ -58,7 +58,7 @@ package object nodescala {
       val p = Promise[T]()
 
       fs.foreach(f => f.onComplete {
-        case result => p.complete(result)
+        case result => p.tryComplete(result)
       })
 
       p.future
@@ -93,7 +93,9 @@ package object nodescala {
       f(cancellationToken)
 
       new Subscription {
-        override def unsubscribe(): Unit = p.complete(Success(()))
+        override def unsubscribe(): Unit = {
+          p.complete(Success(()))
+        }
       }
     }
   }
