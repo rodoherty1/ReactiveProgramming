@@ -70,10 +70,10 @@ class SwingApiTest extends FunSuite {
   
   test("SwingApi should emit text field values to the observable") {
     val textField = new swingApi.TextField
-    val values = textField.textValues
+    val values: Observable[String] = textField.textValues
 
     val observed = mutable.Buffer[String]()
-    val sub = values subscribe {
+    val sub: Subscription = values subscribe {
       observed += _
     }
 
