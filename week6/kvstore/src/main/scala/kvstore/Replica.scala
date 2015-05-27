@@ -1,9 +1,10 @@
 package kvstore
 
-import akka.actor.{ActorLogging, Actor, ActorRef, Props}
-import akka.persistence.{AtLeastOnceDelivery, PersistentActor}
+import akka.actor._
 import kvstore.Arbiter._
 import kvstore.Persistence.{Persisted, Persist}
+import scala.concurrent.duration._
+
 
 object Replica {
 
@@ -34,14 +35,19 @@ object Replica {
 
   case class SnapshotAckDelivered(deliveryId: Long)
 
+  case class PersistFailed(id: Long)
+
   def props(arbiter: ActorRef, persistenceProps: Props): Props = Props(new Replica(arbiter, persistenceProps))
 }
 
-class Replica(val arbiter: ActorRef, persistenceProps: Props) extends PersistentActor with AtLeastOnceDelivery with ActorLogging {
+class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with ActorLogging {
 
   import Replica._
   import Replicator._
+  import context.dispatcher
+  import scala.language.postfixOps
 
+  val persister = context.actorOf(persistenceProps)
   /*
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
    */
@@ -51,6 +57,9 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Persistent
   // a map from secondary replicas to replicators
   var secondaries = Map.empty[ActorRef, ActorRef]
 
+  var pendingPersists = Map.empty[Long, (ActorRef, Persist, Cancellable)]
+  var persists = Map.empty[Long, Persist]
+
   // the current set of replicators
   var replicators = Set.empty[ActorRef]
 
@@ -58,21 +67,40 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Persistent
 
   arbiter ! Join
 
-//  override def persistenceId: String = self.path.toStringWithoutAddress
-
   def DeliverSnapshotAck(k: String, id: Long, l1: Long) = SnapshotAck(k, id)
 
-  def receiveCommand = {
+  def receive = {
     case JoinedSecondary =>
       context.become(replica)
     case JoinedPrimary =>
       context.become(leader)
   }
 
+  def persist(k: String, v: Option[String], id: Long) = {
+    val persistEvent  = Persist(k, v, id)
+    updateState(persistEvent)
+    val cancellable = context.system.scheduler.schedule(0 millis, 100 millis, persister, persistEvent)
+    pendingPersists = pendingPersists.updated(id, (sender(), persistEvent, cancellable))
+
+    context.system.scheduler.scheduleOnce(1 second, self, PersistFailed(id))
+  }
+
   val leader: Receive = {
-    case Insert(k, v, id) => kv = kv updated(k, v); sender() ! OperationAck(id)
+    case Insert(k, v, id) => persist(k, Some(v), id)
     case Remove(k, id) => kv = kv - k; sender() ! OperationAck(id)
     case Get(k, id) => sender() ! GetResult(k, kv.get(k), id)
+
+    case Persisted (k, id) => cancelPersists(id)(OperationAck(id))
+
+    case PersistFailed(id) =>
+      if (pendingPersists.contains(id)) {
+        val (_, persistEvent, _) = pendingPersists(id)
+        cancelPersists(id)(OperationFailed(id))
+
+        updateState(Persist(persistEvent.key, None, id))
+
+        pendingPersists = pendingPersists - id
+      }
   }
 
 
@@ -84,6 +112,13 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Persistent
     expectedId += 1
   }
 
+  def cancelPersists(id: Long)(ack: Any): Unit = {
+    val (senderRef, persist, cancellable) = pendingPersists(id)
+    pendingPersists = pendingPersists - id
+    cancellable.cancel()
+    senderRef ! ack
+  }
+
 
   val replica: Receive = {
     case Get(k, id) =>
@@ -91,32 +126,24 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Persistent
 
     case Snapshot(k, v, id) =>
       if (id == expectedId) {
-        persist(Persist(k, v, id))(updateState)
-        deliver(sender().path, DeliverSnapshotAck(k, id, _))
-//          { e =>
-//          v match {
-//            case Some(value) => kv = kv.updated(k, value)
-//            case None => kv = kv - k
-//          }
-//          expectedId += 1
-//          deliver(sender().path, DeliverSnapshotAck(k, id, _))
-//        }
+        persist(k, v, id)
       } else if (id < expectedId) {
-        log.info("id < expectedId")
-        deliver(sender().path, DeliverSnapshotAck(k, id, _))
+        sender() ! SnapshotAck(k, id)
       } else {
         ()
       }
 
-    case Persisted (k, id) => confirmDelivery(id)
+    case Persisted (k, id) => cancelPersists(id)(SnapshotAck(k, id))
 
     case x => log.info("Unhandled message {}", x)
   }
 
-  override def receiveRecover: Receive = {
-    case Persist(k, v, id) => deliver(sender().path, DeliverSnapshotAck(k, id, _))
-    case Persisted(k, deliveryId) => confirmDelivery(deliveryId)
-    case _ => ()
-  }
+//  override def receiveRecover: Receive = {
+//    case Persist(k, v, id) =>
+//      pendingPersists = pendingPersists.updated(id, Persist(k, v, id))
+//      sender() ! SnapshotAck(k, id)
+//    case Persisted(_, deliveryId) => updateState(pendingPersists(deliveryId))
+//    case _ => ()
+//  }
 }
 

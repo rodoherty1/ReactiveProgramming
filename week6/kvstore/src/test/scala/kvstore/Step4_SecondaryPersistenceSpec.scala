@@ -56,7 +56,7 @@ class Step4_SecondaryPersistenceSpec extends TestKit(ActorSystem("Step4Secondary
     client.get("k1") should ===(Some("v1"))
   }
 
-  ignore("case2: Secondary should retry persistence in every 100 milliseconds") {
+  test("case2: Secondary should retry persistence in every 100 milliseconds") {
     import Replicator._
 
     val arbiter = TestProbe()
