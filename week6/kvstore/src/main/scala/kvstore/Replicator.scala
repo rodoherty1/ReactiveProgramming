@@ -1,6 +1,6 @@
 package kvstore
 
-import akka.actor.{Actor, ActorRef, Cancellable, Props}
+import akka.actor._
 
 import scala.concurrent.duration._
 import scala.language.postfixOps
@@ -20,7 +20,7 @@ object Replicator {
   def props(replica: ActorRef): Props = Props(new Replicator(replica))
 }
 
-class Replicator(val replica: ActorRef) extends Actor {
+class Replicator(val replica: ActorRef) extends Actor with ActorLogging {
 
   import Replicator._
   import context.dispatcher
@@ -47,6 +47,8 @@ class Replicator(val replica: ActorRef) extends Actor {
 
   def receive: Receive = {
     case Replicate(k, v, id) => {
+      log.info(s"Received Replicate $k, $v from ${sender()}")
+
       val cancellable = context.system.scheduler.schedule(0 seconds, 250 millis, replica, Snapshot(k, v, id))
       pendingSnapshotAcks = pendingSnapshotAcks.updated(id, cancellable)
       context.system.scheduler.scheduleOnce(1 second, self, CancelSnapshotMessage(id))

@@ -42,6 +42,8 @@ object Replica {
 
 class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with ActorLogging {
 
+  case class IdGenerator(id: Int)
+
   import Replica._
   import Replicator._
   import context.dispatcher
@@ -58,7 +60,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   var secondaries = Map.empty[ActorRef, ActorRef]
 
   var pendingPersists = Map.empty[Long, (ActorRef, Persist, Cancellable)]
-  var persists = Map.empty[Long, Persist]
+  var events = List.empty[Persist]
 
   // the current set of replicators
   var replicators = Set.empty[ActorRef]
@@ -85,10 +87,64 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     context.system.scheduler.scheduleOnce(1 second, self, PersistFailed(id))
   }
 
+  var idGen = IdGenerator(0)
+
+  def nextId(): Int = {
+    idGen = IdGenerator(idGen.id + 1)
+    idGen.id
+  }
+
+  def setupNewSecondaries(newSecondaries: Set[ActorRef]): Map[ActorRef, ActorRef] = {
+    newSecondaries.foldLeft(Map.empty[ActorRef, ActorRef])((b, a) => {
+      if (secondaries.contains(a)) {
+        b.updated(a, secondaries(a))
+      } else {
+        val replicator = context.actorOf(Props(new Replicator(a)), name = "Replicator" + nextId)
+        log.info(s"Sending ${events.size} events to $replicator")
+        events.reverse.foreach(e => replicator ! Replicate(e.key, e.valueOption, e.id))
+        b.updated(a, replicator)
+      }
+    })
+  }
+
+  def retireOldSecondaries(newSecondaries: Map[ActorRef, ActorRef]): Unit = {
+    secondaries.keys.foreach(secondary => {
+      if (!newSecondaries.contains(secondary)) {
+        val replica = secondaries(secondary)
+        context.stop(replica)
+      }
+    })
+  }
+
+  def replicate(k: String, v: Option[String], id: Long): Unit = {
+    /*
+    Here I am sending out Replicate messages to each replicator.  I need to send this message every 100ms until I receive
+    a Replicated message, at which point, I cancel the schedule.
+    I need to track each one and if it fails, send an OperationFailed messges to the original sender.
+     */
+    secondaries.values.foreach(replicator => replicator ! Replicate(k, v, id))
+  }
+
   val leader: Receive = {
-    case Insert(k, v, id) => persist(k, Some(v), id)
-    case Remove(k, id) => kv = kv - k; sender() ! OperationAck(id)
+    case Insert(k, v, id) => {
+      persist(k, Some(v), id)
+      replicate(k, Some(v), id)
+    }
+    case Remove(k, id) => {
+      persist(k, None, id)
+      replicate(k, None, id)
+    }
+
     case Get(k, id) => sender() ! GetResult(k, kv.get(k), id)
+
+    // Create Replicator for each Replica.  Then forward all events to the Replica.  See "The Replication Protocol" in the assignment.
+    case Replicas(replicas) =>
+      log.info (s"Received new replicas $replicas")
+      val newSecondaries = setupNewSecondaries(replicas)
+      retireOldSecondaries(newSecondaries)
+      log.info (s"Old secondaries: $secondaries")
+      secondaries = newSecondaries
+      log.info (s"New secondaries: $secondaries")
 
     case Persisted (k, id) => cancelPersists(id)(OperationAck(id))
 
@@ -105,6 +161,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
 
   def updateState(e: Persist): Unit = {
+    events = e :: events
+
     e.valueOption match {
       case Some(value) => kv = kv.updated(e.key, value)
       case None => kv = kv - e.key
