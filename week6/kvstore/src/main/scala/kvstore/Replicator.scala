@@ -35,7 +35,7 @@ class Replicator(val replica: ActorRef) extends Actor with ActorLogging {
   // a sequence of not-yet-sent snapshots (you can disregard this if not implementing batching)
   var pending = Vector.empty[Snapshot]
 
-  var pendingSnapshotAcks = Map.empty[Long, Cancellable]
+  var pendingSnapshotAcks = Map.empty[Long, (ActorRef, Cancellable)]
 
   var _seqCounter = 0L
 
@@ -47,17 +47,23 @@ class Replicator(val replica: ActorRef) extends Actor with ActorLogging {
 
   def receive: Receive = {
     case Replicate(k, v, id) => {
-      log.info(s"Received Replicate $k, $v from ${sender()}")
+      log.debug(s"Received Replicate $k, $v from ${sender()}")
 
       val cancellable = context.system.scheduler.schedule(0 seconds, 250 millis, replica, Snapshot(k, v, id))
-      pendingSnapshotAcks = pendingSnapshotAcks.updated(id, cancellable)
+      pendingSnapshotAcks = pendingSnapshotAcks.updated(id, (sender(), cancellable))
       context.system.scheduler.scheduleOnce(1 second, self, CancelSnapshotMessage(id))
-
     }
 
-    case SnapshotAck(k, id) => pendingSnapshotAcks(id).cancel(); pendingSnapshotAcks = pendingSnapshotAcks - id
+    case SnapshotAck(k, id) =>
+      val (senderRef, cancellable) = pendingSnapshotAcks(id)
+      cancellable.cancel()
+      pendingSnapshotAcks = pendingSnapshotAcks - id
+      senderRef ! Replicated(k, id)
 
-    case CancelSnapshotMessage(id) => pendingSnapshotAcks(id).cancel()
+    case CancelSnapshotMessage(id) =>
+      val (_, cancellable) = pendingSnapshotAcks(id)
+      cancellable.cancel()
+      pendingSnapshotAcks = pendingSnapshotAcks - id
   }
 
 }
