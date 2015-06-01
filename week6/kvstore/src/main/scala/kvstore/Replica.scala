@@ -37,6 +37,7 @@ object Replica {
 
   case class PersistFailed(id: Long)
   case class CancelReplication(id: Long)
+  case class AcknowledgeEvent(id: Long, msg: Any)
 
   def props(arbiter: ActorRef, persistenceProps: Props): Props = Props(new Replica(arbiter, persistenceProps))
 }
@@ -60,12 +61,15 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   // a map from secondary replicas to replicators
   var secondaries = Map.empty[ActorRef, ActorRef]
 
-  var pendingPersists = Map.empty[Long, (ActorRef, Persist, Cancellable)]
-  var pendingReplications = Map.empty[Long, Map[ActorRef, (ActorRef, Replicate, Cancellable)]]
+  var pendingPersists = Map.empty[Long, (Persist, Cancellable)]
+  var pendingReplications = Map.empty[Long, Map[ActorRef, Cancellable]]
   var events = List.empty[Persist]
 
   // the current set of replicators
   var replicators = Set.empty[ActorRef]
+
+  var unacknowledgedEvents = Map.empty[Long, ActorRef]
+
 
   var expectedId = 0L
 
@@ -84,7 +88,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     val persistEvent  = Persist(k, v, id)
     updateState(persistEvent)
     val cancellable = context.system.scheduler.schedule(0 millis, 100 millis, persister, persistEvent)
-    pendingPersists = pendingPersists.updated(id, (sender(), persistEvent, cancellable))
+    pendingPersists = pendingPersists.updated(id, (persistEvent, cancellable))
 
     context.system.scheduler.scheduleOnce(1 second, self, PersistFailed(id))
   }
@@ -98,7 +102,9 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
   def setupNewSecondaries(newSecondaries: Set[ActorRef]): Map[ActorRef, ActorRef] = {
     newSecondaries.foldLeft(Map.empty[ActorRef, ActorRef])((b, a) => {
-      if (secondaries.contains(a)) {
+      if (a.path.equals(self.path)) {
+        b
+      } else if (secondaries.contains(a)) {
         b.updated(a, secondaries(a))
       } else {
         val replicator = context.actorOf(Props(new Replicator(a)), name = "Replicator" + nextId)
@@ -109,72 +115,132 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     })
   }
 
-  def retireOldSecondaries(newSecondaries: Map[ActorRef, ActorRef]): Unit = {
-    secondaries.keys.foreach(secondary => {
-      if (!newSecondaries.contains(secondary)) {
-        val replica = secondaries(secondary)
-        context.stop(replica)
+  def removeReplicatorFromPendingReplications(replicator: ActorRef) = {
+    pendingReplications.keys.foreach(id => {
+      val replicatorToCancellable = pendingReplications(id)
+      if (replicatorToCancellable.contains(replicator)) {
+        val cancellable = replicatorToCancellable(replicator)
+        cancellable.cancel()
+        if (replicatorToCancellable.size == 1) {
+          self ! AcknowledgeEvent(id, OperationAck(id))
+        } else {
+          pendingReplications = pendingReplications updated (id, replicatorToCancellable - replicator)
+        }
       }
     })
   }
 
-  def replicate(k: String, v: Option[String], id: Long): Unit = {
-    /*
-    Here I am sending out Replicate messages to each replicator.  I need to send this message every 100ms until I receive
-    a Replicated message, at which point, I cancel the schedule.
-    I need to track each one and if it fails, send an OperationFailed message to the original sender.
-     */
-    val replicateMsg = Replicate(k, v, id)
-    val pendingReplicationsForOperation = secondaries.values.foldLeft(Map.empty[ActorRef, (ActorRef, Replicate, Cancellable)])((b, replicator) => {
-      val cancellable = context.system.scheduler.schedule(0 millis, 100 millis, replicator, replicateMsg)
-      Map(replicator -> (sender(), replicateMsg, cancellable))
+  def retireOldSecondaries(newSecondaries: Map[ActorRef, ActorRef]): Unit = {
+    secondaries.keys.foreach(secondary => {
+      if (!newSecondaries.contains(secondary)) {
+        val replicator = secondaries(secondary)
+        context.stop(replicator)
+        removeReplicatorFromPendingReplications(replicator)
+      }
     })
 
-    pendingReplications = pendingReplications.updated(id, pendingReplicationsForOperation)
+  }
 
-    context.system.scheduler.scheduleOnce(1 second, self, CancelReplication(id))
+  def replicate(k: String, v: Option[String], id: Long): Unit = {
+    if (secondaries.nonEmpty) {
+      val replicateMsg = Replicate(k, v, id)
+      val pendingReplicationsForOperation = secondaries.values.foldLeft(Map.empty[ActorRef, Cancellable])((b, replicator) => {
+        val cancellable = context.system.scheduler.schedule(0 millis, 100 millis, replicator, replicateMsg)
+        b.updated(replicator, cancellable)
+      })
+
+//      unacknowledgedEvents = unacknowledgedEvents.updated(id, sender())
+//
+      pendingReplications = pendingReplications.updated(id, pendingReplicationsForOperation)
+
+      context.system.scheduler.scheduleOnce(1 second, self, CancelReplication(id))
+//    } else {
+//      sender() ! OperationAck(id)
+    }
   }
 
   val leader: Receive = {
     case Insert(k, v, id) =>
+      unacknowledgedEvents = unacknowledgedEvents.updated(id, sender())
       persist(k, Some(v), id)
       replicate(k, Some(v), id)
     case Remove(k, id) =>
+      unacknowledgedEvents = unacknowledgedEvents.updated(id, sender())
       persist(k, None, id)
       replicate(k, None, id)
 
     case Get(k, id) => sender() ! GetResult(k, kv.get(k), id)
 
-    // Create Replicator for each Replica.
-    // Then forward all events to the Replica.
-    // See "The Replication Protocol" in the assignment.
     case Replicas(replicas) =>
       val newSecondaries = setupNewSecondaries(replicas)
       retireOldSecondaries(newSecondaries)
       secondaries = newSecondaries
 
-    case Persisted (k, id) => cancelPersists(id)(OperationAck(id))
+    case Persisted (k, id) =>
+      val originalSender = cancelPersists(id)
+      if (!pendingReplications.contains(id) || secondaries.isEmpty) {
+        self ! AcknowledgeEvent(id, OperationAck(id))
+//        originalSender ! OperationAck(id)
+      }
 
     case PersistFailed(id) =>
       if (pendingPersists.contains(id)) {
-        val (_, persistEvent, _) = pendingPersists(id)
-        cancelPersists(id)(OperationFailed(id))
+        val (persistEvent, _) = pendingPersists(id)
+        cancelPersists(id)
+        //originalSender ! OperationFailed(id)
+        self ! AcknowledgeEvent(id, OperationFailed(id))
+
         updateState(Persist(persistEvent.key, None, id))
         pendingPersists = pendingPersists - id
       }
 
     case Replicated(k, id) =>
+      if (pendingReplications.contains(id)) {
+        val pendingReplicationsForOperation = pendingReplications(id)
+
+        val replicator = sender()
+
+        if (pendingReplicationsForOperation.contains(replicator)) {
+          pendingReplicationsForOperation(replicator).cancel()
+          pendingReplications = pendingReplications.updated(id, pendingReplicationsForOperation - replicator)
+        }
+
+        if (pendingReplicationsForOperation.size == 1) {
+          log.debug("Received all acknowledgments of replication")
+          if (pendingPersists.contains(id)) {
+            log.debug("Withhold OperationAck for id={} until Persist has been acknowledged", id)
+          } else {
+            self ! AcknowledgeEvent(id, OperationAck(id))
+//            unacknowledgedEvents(id) ! OperationAck(id)
+          }
+//          unacknowledgedEvents = unacknowledgedEvents - id
+        } else {
+          log.debug("Awaiting {} more acknowledgments of replication", pendingReplicationsForOperation.size)
+        }
+      } else {
+        log.debug ("Received acknowledgment of replication for id={}.  Ack is too late.  Ignoring!", id)
+      }
 
     case CancelReplication(id) =>
       val pendingReplicationsForOperation = pendingReplications(id)
 
       pendingReplicationsForOperation.keys.foreach(replicator => {
-        val (senderRef, _, cancellable) = pendingReplicationsForOperation(replicator)
-        cancellable.cancel()
-        senderRef ! OperationFailed(id)
+        pendingReplicationsForOperation(replicator).cancel()
       })
 
+      self ! AcknowledgeEvent(id, OperationFailed(id))
+//      val originalSender = unacknowledgedEvents(id)
+//      unacknowledgedEvents = unacknowledgedEvents - id
+//
+//      originalSender ! OperationFailed(id)
+      log.debug("Not all Acknowlegdments of Replication arrived.  Removing id={} from pendingReplications", id)
       pendingReplications = pendingReplications - id
+
+    case AcknowledgeEvent(id, msg) =>
+      if (unacknowledgedEvents.contains(id)) {
+        unacknowledgedEvents(id) ! msg
+        unacknowledgedEvents = unacknowledgedEvents - id
+      }
   }
 
 
@@ -188,11 +254,10 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     expectedId += 1
   }
 
-  def cancelPersists(id: Long)(ack: Any): Unit = {
-    val (senderRef, persist, cancellable) = pendingPersists(id)
+  def cancelPersists(id: Long): Unit = {
+    val (persist, cancellable) = pendingPersists(id)
     pendingPersists = pendingPersists - id
     cancellable.cancel()
-    senderRef ! ack
   }
 
 
@@ -203,14 +268,22 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     case Snapshot(k, v, id) =>
       if (id == expectedId) {
         persist(k, v, id)
-        //sender() ! SnapshotAck(k, id)
+        unacknowledgedEvents = unacknowledgedEvents.updated(id, sender())
       } else if (id < expectedId) {
         sender() ! SnapshotAck(k, id)
       } else {
         ()
       }
 
-    case Persisted (k, id) => cancelPersists(id)(SnapshotAck(k, id))
+    case Persisted (k, id) =>
+      cancelPersists(id)
+      self ! AcknowledgeEvent(id, SnapshotAck(k, id))
+
+    case AcknowledgeEvent(id, msg) =>
+      if (unacknowledgedEvents.contains(id)) {
+        unacknowledgedEvents(id) ! msg
+        unacknowledgedEvents = unacknowledgedEvents - id
+      }
 
     case x => log.info("Unhandled message {}", x)
   }

@@ -55,15 +55,22 @@ class Replicator(val replica: ActorRef) extends Actor with ActorLogging {
     }
 
     case SnapshotAck(k, id) =>
-      val (senderRef, cancellable) = pendingSnapshotAcks(id)
-      cancellable.cancel()
-      pendingSnapshotAcks = pendingSnapshotAcks - id
-      senderRef ! Replicated(k, id)
+      if (pendingSnapshotAcks.contains(id)) {
+        val (senderRef, cancellable) = pendingSnapshotAcks(id)
+        cancellable.cancel()
+        pendingSnapshotAcks = pendingSnapshotAcks - id
+        senderRef ! Replicated(k, id)
+      } else {
+        log.debug("Received SnapshotAck for id={}.  Ack is too late.  Ignoring!", id)
+      }
 
     case CancelSnapshotMessage(id) =>
-      val (_, cancellable) = pendingSnapshotAcks(id)
-      cancellable.cancel()
-      pendingSnapshotAcks = pendingSnapshotAcks - id
+      if (pendingSnapshotAcks.contains(id)) {
+        val (_, cancellable) = pendingSnapshotAcks(id)
+        cancellable.cancel()
+        pendingSnapshotAcks = pendingSnapshotAcks - id
+      } else {
+        log.debug("All SnapshotAcks for id={} have been received.  Ignoring CancelSnapshotMessage!")
+      }
   }
-
 }

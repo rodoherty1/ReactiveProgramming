@@ -99,7 +99,7 @@ class Step5_PrimaryPersistenceSpec extends TestKit(ActorSystem("Step5PrimaryPers
     }
   }
 
-  ignore("case5: Primary acknowledges only after persistence and global acknowledgement") {
+  test("case5: Primary acknowledges only after persistence and global acknowledgement") {
     val arbiter = TestProbe()
     val persistence = TestProbe()
         val primary = system.actorOf(Replica.props(arbiter.ref, Persistence.props(flaky = false)), "case5-primary")
