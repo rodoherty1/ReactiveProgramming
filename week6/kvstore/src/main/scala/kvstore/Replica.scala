@@ -2,7 +2,8 @@ package kvstore
 
 import akka.actor._
 import kvstore.Arbiter._
-import kvstore.Persistence.{Persisted, Persist}
+import kvstore.Persistence.{Persist, Persisted}
+
 import scala.concurrent.duration._
 
 
@@ -39,6 +40,8 @@ object Replica {
   case class CancelReplication(id: Long)
   case class AcknowledgeEvent(id: Long, msg: Any)
 
+  case object RetryPersistence
+
   def props(arbiter: ActorRef, persistenceProps: Props): Props = Props(new Replica(arbiter, persistenceProps))
 }
 
@@ -49,12 +52,24 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   import Replica._
   import Replicator._
   import context.dispatcher
+
   import scala.language.postfixOps
 
-  val persister = context.actorOf(persistenceProps)
-  /*
-   * The contents of this actor is just a suggestion, you can implement it in any way you like.
-   */
+
+//  def refreshPersister: ActorRef = {
+//    context.unwatch(persister)
+//    newPersister
+//  }
+
+  // def newPersister: ActorRef = context.watch(context.actorOf(persistenceProps))
+
+  var persister = context.watch(context.actorOf(persistenceProps))
+
+  override val supervisorStrategy = OneForOneStrategy(loggingEnabled = true) {
+    case _:Exception =>
+      self ! RetryPersistence
+      SupervisorStrategy.restart
+  }
 
   var kv = Map.empty[String, String]
 
@@ -149,14 +164,19 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
         b.updated(replicator, cancellable)
       })
 
-//      unacknowledgedEvents = unacknowledgedEvents.updated(id, sender())
-//
       pendingReplications = pendingReplications.updated(id, pendingReplicationsForOperation)
 
       context.system.scheduler.scheduleOnce(1 second, self, CancelReplication(id))
-//    } else {
-//      sender() ! OperationAck(id)
     }
+  }
+
+  def resendOutstandingPersistMessages(): Unit = {
+    pendingPersists = pendingPersists.map(kv => {
+      val (persistEvent, cancellable) = kv._2
+      cancellable.cancel()
+      val newCancellable = context.system.scheduler.schedule(0 millis, 100 millis, persister, persistEvent)
+      (kv._1, (persistEvent, newCancellable))
+    })
   }
 
   val leader: Receive = {
@@ -164,6 +184,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       unacknowledgedEvents = unacknowledgedEvents.updated(id, sender())
       persist(k, Some(v), id)
       replicate(k, Some(v), id)
+
     case Remove(k, id) =>
       unacknowledgedEvents = unacknowledgedEvents.updated(id, sender())
       persist(k, None, id)
@@ -177,17 +198,15 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       secondaries = newSecondaries
 
     case Persisted (k, id) =>
-      val originalSender = cancelPersists(id)
+      cancelPersists(id)
       if (!pendingReplications.contains(id) || secondaries.isEmpty) {
         self ! AcknowledgeEvent(id, OperationAck(id))
-//        originalSender ! OperationAck(id)
       }
 
     case PersistFailed(id) =>
       if (pendingPersists.contains(id)) {
         val (persistEvent, _) = pendingPersists(id)
         cancelPersists(id)
-        //originalSender ! OperationFailed(id)
         self ! AcknowledgeEvent(id, OperationFailed(id))
 
         updateState(Persist(persistEvent.key, None, id))
@@ -211,9 +230,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
             log.debug("Withhold OperationAck for id={} until Persist has been acknowledged", id)
           } else {
             self ! AcknowledgeEvent(id, OperationAck(id))
-//            unacknowledgedEvents(id) ! OperationAck(id)
           }
-//          unacknowledgedEvents = unacknowledgedEvents - id
         } else {
           log.debug("Awaiting {} more acknowledgments of replication", pendingReplicationsForOperation.size)
         }
@@ -229,10 +246,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       })
 
       self ! AcknowledgeEvent(id, OperationFailed(id))
-//      val originalSender = unacknowledgedEvents(id)
-//      unacknowledgedEvents = unacknowledgedEvents - id
-//
-//      originalSender ! OperationFailed(id)
+
       log.debug("Not all Acknowlegdments of Replication arrived.  Removing id={} from pendingReplications", id)
       pendingReplications = pendingReplications - id
 
@@ -241,6 +255,10 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
         unacknowledgedEvents(id) ! msg
         unacknowledgedEvents = unacknowledgedEvents - id
       }
+
+    case RetryPersistence =>
+      log.info("Retrying persistence")
+      resendOutstandingPersistMessages()
   }
 
 
@@ -279,21 +297,29 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       cancelPersists(id)
       self ! AcknowledgeEvent(id, SnapshotAck(k, id))
 
+    case PersistFailed(id) => // Ignoring
+
     case AcknowledgeEvent(id, msg) =>
       if (unacknowledgedEvents.contains(id)) {
         unacknowledgedEvents(id) ! msg
         unacknowledgedEvents = unacknowledgedEvents - id
       }
 
+    case RetryPersistence =>
+      log.info("Retrying persistence")
+      resendOutstandingPersistMessages()
+
+      
+    case Terminated(deadActorRef) =>
+      log.info("Received Terminated message: {}", deadActorRef.path)
+      if (deadActorRef.path.equals(persister.path)) {
+        log.info("Persister has died")
+
+//        persister = refreshPersister
+        resendOutstandingPersistMessages()
+      }
+
     case x => log.info("Unhandled message {}", x)
   }
-
-//  override def receiveRecover: Receive = {
-//    case Persist(k, v, id) =>
-//      pendingPersists = pendingPersists.updated(id, Persist(k, v, id))
-//      sender() ! SnapshotAck(k, id)
-//    case Persisted(_, deliveryId) => updateState(pendingPersists(deliveryId))
-//    case _ => ()
-//  }
 }
 
