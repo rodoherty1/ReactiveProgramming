@@ -1,8 +1,9 @@
 package kvstore
 
+import akka.actor.SupervisorStrategy.Restart
 import akka.actor._
 import kvstore.Arbiter._
-import kvstore.Persistence.{Persist, Persisted}
+import kvstore.Persistence.{PersistenceException, Persist, Persisted}
 
 import scala.concurrent.duration._
 
@@ -66,9 +67,10 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   var persister = context.watch(context.actorOf(persistenceProps))
 
   override val supervisorStrategy = OneForOneStrategy(loggingEnabled = true) {
-    case _:Exception =>
+    case _:PersistenceException =>
       self ! RetryPersistence
-      SupervisorStrategy.restart
+      Restart
+
   }
 
   var kv = Map.empty[String, String]
@@ -78,6 +80,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
   var pendingPersists = Map.empty[Long, (Persist, Cancellable)]
   var pendingReplications = Map.empty[Long, Map[ActorRef, Cancellable]]
+  var pendingCancelReplicationEvents = Map.empty[Long, Cancellable]
   var events = List.empty[Persist]
 
   // the current set of replicators
@@ -122,7 +125,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       } else if (secondaries.contains(a)) {
         b.updated(a, secondaries(a))
       } else {
-        val replicator = context.actorOf(Props(new Replicator(a)), name = "Replicator" + nextId)
+        val replicator = context.watch(context.actorOf(Props(new Replicator(a)), name = "Replicator" + nextId))
         log.debug(s"Sending ${events.size} events to $replicator")
         events.reverse.foreach(e => replicator ! Replicate(e.key, e.valueOption, e.id))
         b.updated(a, replicator)
@@ -166,16 +169,18 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
       pendingReplications = pendingReplications.updated(id, pendingReplicationsForOperation)
 
-      context.system.scheduler.scheduleOnce(1 second, self, CancelReplication(id))
+      val pendingCancelReplicationEvent = context.system.scheduler.scheduleOnce(1 second, self, CancelReplication(id))
+      pendingCancelReplicationEvents = pendingCancelReplicationEvents.updated(id, pendingCancelReplicationEvent)
     }
   }
 
   def resendOutstandingPersistMessages(): Unit = {
     pendingPersists = pendingPersists.map(kv => {
+      val id = kv._1
       val (persistEvent, cancellable) = kv._2
       cancellable.cancel()
       val newCancellable = context.system.scheduler.schedule(0 millis, 100 millis, persister, persistEvent)
-      (kv._1, (persistEvent, newCancellable))
+      (id, (persistEvent, newCancellable))
     })
   }
 
@@ -198,6 +203,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       secondaries = newSecondaries
 
     case Persisted (k, id) =>
+      log.info("Received Persisted Event for id {}", id)
+      log.info("pendingPerists size {}", pendingPersists.size)
       cancelPersists(id)
       if (!pendingReplications.contains(id) || secondaries.isEmpty) {
         self ! AcknowledgeEvent(id, OperationAck(id))
@@ -214,6 +221,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       }
 
     case Replicated(k, id) =>
+      log.info("Received Replicated msg for id {}", id)
+
       if (pendingReplications.contains(id)) {
         val pendingReplicationsForOperation = pendingReplications(id)
 
@@ -225,20 +234,29 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
         }
 
         if (pendingReplicationsForOperation.size == 1) {
-          log.debug("Received all acknowledgments of replication")
+          pendingReplications = pendingReplications - id // new line!
+
+          pendingCancelReplicationEvents(id).cancel()
+          pendingCancelReplicationEvents = pendingCancelReplicationEvents - id
+
+          log.info("Received all acknowledgments of replication")
           if (pendingPersists.contains(id)) {
             log.debug("Withhold OperationAck for id={} until Persist has been acknowledged", id)
           } else {
             self ! AcknowledgeEvent(id, OperationAck(id))
           }
         } else {
-          log.debug("Awaiting {} more acknowledgments of replication", pendingReplicationsForOperation.size)
+          log.info("Awaiting {} more acknowledgments of replication for id {}", pendingReplicationsForOperation.size, id)
         }
       } else {
         log.debug ("Received acknowledgment of replication for id={}.  Ack is too late.  Ignoring!", id)
       }
 
     case CancelReplication(id) =>
+      log.info("Received CancelReplication for id {}", id)
+      log.info("PendingPersists size = {}", pendingPersists.size)
+      log.info("PendingReplications size = {}", pendingReplications.size)
+
       val pendingReplicationsForOperation = pendingReplications(id)
 
       pendingReplicationsForOperation.keys.foreach(replicator => {
@@ -247,7 +265,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
       self ! AcknowledgeEvent(id, OperationFailed(id))
 
-      log.debug("Not all Acknowlegdments of Replication arrived.  Removing id={} from pendingReplications", id)
+      log.debug("Not all Acknowledgements of Replication arrived.  Removing id={} from pendingReplications", id)
       pendingReplications = pendingReplications - id
 
     case AcknowledgeEvent(id, msg) =>
@@ -259,6 +277,11 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     case RetryPersistence =>
       log.info("Retrying persistence")
       resendOutstandingPersistMessages()
+
+    case Terminated(a) =>
+      log.info("Something was terminated! {}", a)
+      //self ! RetryPersistence
+
   }
 
 
@@ -309,7 +332,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       log.info("Retrying persistence")
       resendOutstandingPersistMessages()
 
-      
+
     case Terminated(deadActorRef) =>
       log.info("Received Terminated message: {}", deadActorRef.path)
       if (deadActorRef.path.equals(persister.path)) {
