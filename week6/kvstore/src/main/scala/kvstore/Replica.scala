@@ -1,6 +1,6 @@
 package kvstore
 
-import akka.actor.SupervisorStrategy.Restart
+import akka.actor.SupervisorStrategy.{Stop, Restart}
 import akka.actor._
 import kvstore.Arbiter._
 import kvstore.Persistence.{PersistenceException, Persist, Persisted}
@@ -42,6 +42,7 @@ object Replica {
   case class AcknowledgeEvent(id: Long, msg: Any)
 
   case object RetryPersistence
+  case class RetryReplication(replicator: ActorRef)
 
   def props(arbiter: ActorRef, persistenceProps: Props): Props = Props(new Replica(arbiter, persistenceProps))
 }
@@ -56,21 +57,17 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
   import scala.language.postfixOps
 
-
-//  def refreshPersister: ActorRef = {
-//    context.unwatch(persister)
-//    newPersister
-//  }
-
-  // def newPersister: ActorRef = context.watch(context.actorOf(persistenceProps))
-
   var persister = context.watch(context.actorOf(persistenceProps))
 
   override val supervisorStrategy = OneForOneStrategy(loggingEnabled = true) {
-    case _:PersistenceException =>
+    case p:PersistenceException =>
+      log.info("Hit a PersistenceException.  Restarting Persister ActorRef")
       self ! RetryPersistence
       Restart
 
+    case e:Exception =>
+      log.info("Hit an Exception {}", e)
+      Stop
   }
 
   var kv = Map.empty[String, String]
@@ -79,12 +76,12 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   var secondaries = Map.empty[ActorRef, ActorRef]
 
   var pendingPersists = Map.empty[Long, (Persist, Cancellable)]
-  var pendingReplications = Map.empty[Long, Map[ActorRef, Cancellable]]
+  var pendingReplications = Map.empty[Long, Map[ActorRef, (Replicate, Cancellable)]]
   var pendingCancelReplicationEvents = Map.empty[Long, Cancellable]
   var events = List.empty[Persist]
 
-  // the current set of replicators
-  var replicators = Set.empty[ActorRef]
+  // a map from secondary replicators to replicas
+  var replicators = Map.empty[ActorRef, ActorRef]
 
   var unacknowledgedEvents = Map.empty[Long, ActorRef]
 
@@ -126,6 +123,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
         b.updated(a, secondaries(a))
       } else {
         val replicator = context.watch(context.actorOf(Props(new Replicator(a)), name = "Replicator" + nextId))
+        replicators = replicators.updated(replicator, a)
+
         log.debug(s"Sending ${events.size} events to $replicator")
         events.reverse.foreach(e => replicator ! Replicate(e.key, e.valueOption, e.id))
         b.updated(a, replicator)
@@ -133,16 +132,16 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     })
   }
 
-  def removeReplicatorFromPendingReplications(replicator: ActorRef) = {
+  def removeReplicatorFromPendingReplications(secondary: ActorRef) = {
     pendingReplications.keys.foreach(id => {
-      val replicatorToCancellable = pendingReplications(id)
-      if (replicatorToCancellable.contains(replicator)) {
-        val cancellable = replicatorToCancellable(replicator)
+      val secondaryToCancellable = pendingReplications(id)
+      if (secondaryToCancellable.contains(secondary)) {
+        val (_, cancellable) = secondaryToCancellable(secondary)
         cancellable.cancel()
-        if (replicatorToCancellable.size == 1) {
+        if (secondaryToCancellable.size == 1) {
           self ! AcknowledgeEvent(id, OperationAck(id))
         } else {
-          pendingReplications = pendingReplications updated (id, replicatorToCancellable - replicator)
+          pendingReplications = pendingReplications updated (id, secondaryToCancellable - secondary)
         }
       }
     })
@@ -152,8 +151,10 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     secondaries.keys.foreach(secondary => {
       if (!newSecondaries.contains(secondary)) {
         val replicator = secondaries(secondary)
+        replicators = replicators - replicator
+        log.info("Retiring replicator {}", replicator)
         context.stop(replicator)
-        removeReplicatorFromPendingReplications(replicator)
+        removeReplicatorFromPendingReplications(secondary)
       }
     })
 
@@ -162,9 +163,9 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   def replicate(k: String, v: Option[String], id: Long): Unit = {
     if (secondaries.nonEmpty) {
       val replicateMsg = Replicate(k, v, id)
-      val pendingReplicationsForOperation = secondaries.values.foldLeft(Map.empty[ActorRef, Cancellable])((b, replicator) => {
-        val cancellable = context.system.scheduler.schedule(0 millis, 100 millis, replicator, replicateMsg)
-        b.updated(replicator, cancellable)
+      val pendingReplicationsForOperation = secondaries.keys.foldLeft(Map.empty[ActorRef, (Replicate, Cancellable)])((b, secondary) => {
+        val cancellable = context.system.scheduler.schedule(0 millis, 100 millis, secondaries(secondary), replicateMsg)
+        b.updated(secondary, (replicateMsg, cancellable))
       })
 
       pendingReplications = pendingReplications.updated(id, pendingReplicationsForOperation)
@@ -182,6 +183,31 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       val newCancellable = context.system.scheduler.schedule(0 millis, 100 millis, persister, persistEvent)
       (id, (persistEvent, newCancellable))
     })
+  }
+
+  def resendOutstandingReplicationMessages(secondary: ActorRef): Unit = {
+    val replicator = secondaries(secondary)
+
+    pendingReplications = pendingReplications.map(kv => {
+      val id = kv._1
+      val m: Map[ActorRef, (Replicate, Cancellable)] = kv._2
+
+      if (m.contains(secondary)) {
+        val (replicateMsg, cancellable) = m(secondary)
+        cancellable.cancel()
+
+        val newCancellable = context.system.scheduler.schedule(0 millis, 100 millis, replicator, replicateMsg)
+        m updated (secondary, (replicateMsg, newCancellable))
+      }
+      (id, m)
+    })
+  }
+
+
+  def replaceReplicator(secondary: ActorRef) = {
+    val newReplicator = context.watch(context.actorOf(Props(new Replicator(secondary)), name = "Replicator" + nextId))
+    replicators = replicators.updated(newReplicator, secondary)
+    secondaries = secondaries.updated(secondary, newReplicator)
   }
 
   val leader: Receive = {
@@ -204,7 +230,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
     case Persisted (k, id) =>
       log.info("Received Persisted Event for id {}", id)
-      log.info("pendingPerists size {}", pendingPersists.size)
+      log.debug("pendingPerists size {}", pendingPersists.size)
       cancelPersists(id)
       if (!pendingReplications.contains(id) || secondaries.isEmpty) {
         self ! AcknowledgeEvent(id, OperationAck(id))
@@ -221,27 +247,32 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       }
 
     case Replicated(k, id) =>
-      log.info("Received Replicated msg for id {}", id)
+      log.info("Received Replicated msg for id {} from {}", id, sender().path)
 
       if (pendingReplications.contains(id)) {
         val pendingReplicationsForOperation = pendingReplications(id)
 
         val replicator = sender()
+        val secondary = replicators(replicator)
 
-        if (pendingReplicationsForOperation.contains(replicator)) {
-          pendingReplicationsForOperation(replicator).cancel()
-          pendingReplications = pendingReplications.updated(id, pendingReplicationsForOperation - replicator)
+
+        if (pendingReplicationsForOperation.contains(secondary)) {
+          pendingReplicationsForOperation(secondary)._2.cancel()
+          pendingReplications = pendingReplications.updated(id, pendingReplicationsForOperation - secondary)
         }
 
         if (pendingReplicationsForOperation.size == 1) {
-          pendingReplications = pendingReplications - id // new line!
+          pendingReplications = pendingReplications - id
 
-          pendingCancelReplicationEvents(id).cancel()
+
+          val cancelReplicationEvent = pendingCancelReplicationEvents(id)
+          log.info("Aborting CancelReplication message for id {}", id)
+          cancelReplicationEvent.cancel()
           pendingCancelReplicationEvents = pendingCancelReplicationEvents - id
 
-          log.info("Received all acknowledgments of replication")
+          log.info("Received all acknowledgments of replication for id {}", id)
           if (pendingPersists.contains(id)) {
-            log.debug("Withhold OperationAck for id={} until Persist has been acknowledged", id)
+            log.info("Withholding OperationAck for id {} until Persist has been acknowledged", id)
           } else {
             self ! AcknowledgeEvent(id, OperationAck(id))
           }
@@ -255,12 +286,12 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     case CancelReplication(id) =>
       log.info("Received CancelReplication for id {}", id)
       log.info("PendingPersists size = {}", pendingPersists.size)
-      log.info("PendingReplications size = {}", pendingReplications.size)
+      log.info("PendingReplications for id {}, size {}", id, pendingReplications(id).size)
 
       val pendingReplicationsForOperation = pendingReplications(id)
 
-      pendingReplicationsForOperation.keys.foreach(replicator => {
-        pendingReplicationsForOperation(replicator).cancel()
+      pendingReplicationsForOperation.keys.foreach(secondary => {
+        pendingReplicationsForOperation(secondary)._2.cancel()
       })
 
       self ! AcknowledgeEvent(id, OperationFailed(id))
@@ -278,10 +309,14 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       log.info("Retrying persistence")
       resendOutstandingPersistMessages()
 
-    case Terminated(a) =>
-      log.info("Something was terminated! {}", a)
-      //self ! RetryPersistence
 
+    case Terminated(deadReplicator) =>
+      log.info("Something was terminated: {}", deadReplicator.path)
+      if (replicators.contains(deadReplicator)) {
+        val secondary = replicators(deadReplicator)
+        replaceReplicator(secondary)
+        resendOutstandingReplicationMessages(secondary)
+      }
   }
 
 
@@ -338,7 +373,6 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       if (deadActorRef.path.equals(persister.path)) {
         log.info("Persister has died")
 
-//        persister = refreshPersister
         resendOutstandingPersistMessages()
       }
 

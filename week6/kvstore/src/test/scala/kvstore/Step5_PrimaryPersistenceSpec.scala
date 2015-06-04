@@ -164,8 +164,8 @@ with Tools {
 
     user.setAcked("k1", "v1")
 
-    val (secondary1, replica1) = createSecondary(arbiter, "case8-secondary1", flakyForwarder = false, flakyPersistence = false)
-    val (secondary2, replica2) = createSecondary(arbiter, "case8-secondary2", flakyForwarder = false, flakyPersistence = false)
+    val (secondary1, replica1) = createSecondary(arbiter, "case8-secondary1", flakyForwarder = true, flakyPersistence = true)
+    val (secondary2, replica2) = createSecondary(arbiter, "case8-secondary2", flakyForwarder = true, flakyPersistence = true)
 
     arbiter.send(primary, Replicas(Set(primary, secondary1, secondary2)))
 
@@ -177,7 +177,7 @@ with Tools {
     assert(replica1.get("k1") === Some("v2"))
     assert(replica2.get("k1") === Some("v2"))
 
-    val (secondary3, replica3) = createSecondary(arbiter, "case8-secondary3", flakyForwarder = false, flakyPersistence = false)
+    val (secondary3, replica3) = createSecondary(arbiter, "case8-secondary3", flakyForwarder = true, flakyPersistence = true)
 
     arbiter.send(primary, Replicas(Set(primary, secondary1, secondary3)))
 
