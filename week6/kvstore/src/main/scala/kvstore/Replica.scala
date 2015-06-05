@@ -109,10 +109,16 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   }
 
   var idGen = IdGenerator(0)
+  var persistenceIdGen = IdGenerator(0)
 
   def nextId(): Int = {
     idGen = IdGenerator(idGen.id + 1)
     idGen.id
+  }
+
+  def nextPersistenceId(): Int = {
+    persistenceIdGen = IdGenerator(persistenceIdGen.id + 1)
+    persistenceIdGen.id
   }
 
   def setupNewSecondaries(newSecondaries: Set[ActorRef]): Map[ActorRef, ActorRef] = {
